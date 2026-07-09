@@ -142,8 +142,11 @@ couple of seconds.
 - this only works for python version 3.11 and before
   if you have a later version downlowd a previous one and run it in a virtual environment.
   (for virtual env go to powershell and type
+  
    cd Downloads\lyrics_display
+  
    py -3.11 -m venv venv
+  
    venv\Scripts\activate)
 - Not every track has synced lyrics on lrclib.net. If none are found,
   the display just shows the song title and artist instead.
