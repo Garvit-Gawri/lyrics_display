@@ -1,0 +1,187 @@
+import asyncio
+import re
+import time
+
+import requests
+import serial
+from winsdk.windows.media.control import (
+    GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+)
+
+# ---- CONFIG ----
+SERIAL_PORT = "COM3"   # <-- change this to your Arduino's port
+BAUD_RATE = 9600
+POLL_SECONDS = 1
+
+
+def connect_arduino():
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)  # give the Arduino time to reset after the serial connection opens
+    return ser
+
+
+async def get_apple_music_session():
+    """Find the media session belonging to Apple Music, if it's active."""
+    manager = await MediaManager.request_async()
+    sessions = manager.get_sessions()
+    for session in sessions:
+        aumid = session.source_app_user_model_id or ""
+        if "applemusic" in aumid.lower() or "apple" in aumid.lower():
+            return session
+    # Fallback: if Apple Music isn't found by name, just use whichever
+    # session Windows considers "current" (works if it's the only app playing)
+    return manager.get_current_session()
+
+
+async def get_track_info():
+    session = await get_apple_music_session()
+    if session is None:
+        return None
+
+    props = await session.try_get_media_properties_async()
+    timeline = session.get_timeline_properties()
+
+    position_sec = timeline.position.total_seconds() if timeline.position else 0
+    duration_sec = timeline.end_time.total_seconds() if timeline.end_time else 0
+
+    raw_artist = props.artist or ""
+    # Apple Music's Windows app often stuffs the album into the artist field,
+    # e.g. "The Weeknd — Blinding Lights - Single". Keep just the part before
+    # the em dash (or regular dash) so lrclib can match on the real artist.
+    clean_artist = raw_artist.split("—")[0].split(" - ")[0].strip()
+
+    return {
+        "title": props.title or "",
+        "artist": clean_artist,
+        "position_sec": position_sec,
+        "duration_sec": duration_sec,
+    }
+
+
+LRCLIB_HEADERS = {
+    "User-Agent": "LyricsDisplayProject/1.0 (personal Arduino LCD project)"
+}
+
+
+def fetch_lrc(artist, title, duration_sec):
+    """Fetch synced lyrics (LRC text) from the free lrclib.net API, or None.
+    Tries an exact match first, then falls back to a looser search."""
+    # Attempt 1: exact match (artist + title + duration)
+    try:
+        params = {"artist_name": artist, "track_name": title}
+        if duration_sec:
+            params["duration"] = round(duration_sec)
+        resp = requests.get("https://lrclib.net/api/get", params=params, headers=LRCLIB_HEADERS, timeout=8)
+        print(f"[debug] /api/get status={resp.status_code} params={params}")
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("syncedLyrics"):
+                return data["syncedLyrics"]
+            print("[debug] /api/get returned no syncedLyrics field")
+    except requests.RequestException as e:
+        print(f"[debug] /api/get request failed: {e}")
+
+    # Attempt 2: looser search (no duration requirement), take first result with synced lyrics
+    try:
+        search_params = {"artist_name": artist, "track_name": title}
+        resp = requests.get("https://lrclib.net/api/search", params=search_params, headers=LRCLIB_HEADERS, timeout=8)
+        print(f"[debug] /api/search status={resp.status_code} params={search_params}")
+        if resp.status_code == 200:
+            results = resp.json()
+            print(f"[debug] /api/search returned {len(results)} result(s)")
+            for item in results:
+                if item.get("syncedLyrics"):
+                    return item["syncedLyrics"]
+            print("[debug] none of the search results had syncedLyrics")
+    except requests.RequestException as e:
+        print(f"[debug] /api/search request failed: {e}")
+
+    return None
+
+
+LRC_LINE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)")
+
+
+def parse_lrc(lrc_text):
+    lines = []
+    for raw in lrc_text.splitlines():
+        m = LRC_LINE.match(raw)
+        if m:
+            minutes, seconds, text = m.groups()
+            lines.append((int(minutes) * 60 + float(seconds), text.strip()))
+    lines.sort(key=lambda x: x[0])
+    return lines
+
+
+def split_for_lcd(text, width=16):
+    """Split one lyric line into a top row (up to `width` chars, broken at
+    a word boundary) and a bottom row (the rest, however long). The Arduino
+    sketch will auto-scroll either row if it doesn't fit in `width` chars."""
+    text = text.strip()
+    if len(text) <= width:
+        return text, ""
+    break_point = text.rfind(" ", 0, width)
+    if break_point == -1:
+        break_point = width
+    return text[:break_point].strip(), text[break_point:].strip()
+
+
+def send_to_lcd(ser, line1, line2):
+    ser.write(f"{line1}|{line2}\n".encode("utf-8"))
+
+
+async def main():
+    ser = connect_arduino()
+
+    current_key = None
+    lyric_lines = []
+    last_sent_index = -1
+
+    print("Listening for Apple Music playback... (Ctrl+C to stop)")
+
+    try:
+        while True:
+            info = await get_track_info()
+
+            if info and info["title"]:
+                track_key = (info["title"], info["artist"])
+
+                if track_key != current_key:
+                    current_key = track_key
+                    print(f"Now playing: '{info['title']}' by '{info['artist']}' (duration: {info['duration_sec']:.0f}s)")
+                    lrc_text = fetch_lrc(info["artist"], info["title"], info["duration_sec"])
+                    lyric_lines = parse_lrc(lrc_text) if lrc_text else []
+                    last_sent_index = -1
+
+                    if not lyric_lines:
+                        print("No synced lyrics found for this track.")
+                        send_to_lcd(ser, info["title"][:16], info["artist"][:16])
+
+                if lyric_lines:
+                    progress_sec = info["position_sec"]
+                    idx = -1
+                    for i, (ts, _) in enumerate(lyric_lines):
+                        if ts <= progress_sec:
+                            idx = i
+                        else:
+                            break
+                    if idx != last_sent_index and idx >= 0:
+                        last_sent_index = idx
+                        _, text = lyric_lines[idx]
+                        l1, l2 = split_for_lcd(text)
+                        send_to_lcd(ser, l1, l2)
+            else:
+                if current_key is not None:
+                    current_key = None
+                    send_to_lcd(ser, "No song", "playing")
+
+            await asyncio.sleep(POLL_SECONDS)
+
+    except KeyboardInterrupt:
+        print("Stopped.")
+    finally:
+        ser.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
