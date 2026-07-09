@@ -54,7 +54,7 @@ needed.
 Once the LCD is wired up and `lyrics_display.ino` is uploaded to the
 Arduino, here's everything to do on the laptop side, step by step:
 
-**Step 1: Check Python is installed**
+**Step 1: Check Python is installed(check point one in troubleshooting)**
 Open a terminal — click Start, type `PowerShell` (or `cmd`), and press
 Enter. Type:
 ```
